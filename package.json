@@ -1,0 +1,14 @@
+{
+  "name": "tinkedin",
+  "version": "0.1.0",
+  "description": "TinkeDin - Take control of your LinkedIn feed",
+  "scripts": {
+    "server": "node backchannel-server.js",
+    "cli": "node tinkedin-cli.js",
+    "state": "node tinkedin-cli.js state",
+    "watch": "node tinkedin-cli.js watch"
+  },
+  "dependencies": {
+    "ws": "^8.14.0"
+  }
+}

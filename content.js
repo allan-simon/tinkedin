@@ -423,7 +423,7 @@
   // POST METADATA EXTRACTION (from DOM elements)
   // ============================================
   function extractPostMetadata(element) {
-    const urn = element.getAttribute('data-urn') || '';
+    const urn = getPostUrn(element) || element.getAttribute('data-urn') || '';
     const activityId = urn.replace('urn:li:activity:', '');
 
     // Author name - try multiple selectors (LinkedIn changes these)
@@ -453,6 +453,81 @@
     const url = `https://www.linkedin.com/feed/update/${urn}/`;
 
     return { urn, activityId, authorName, textPreview, authorImage, url };
+  }
+
+  // ============================================
+  // POST DISCOVERY (supports old and new LinkedIn DOM)
+  // ============================================
+
+  // Extract URN + sponsored flag from LinkedIn's new tracking scope attribute
+  // New LinkedIn encodes post data as a byte array inside data-view-tracking-scope JSON
+  function extractTrackingData(element) {
+    const scope = element.getAttribute('data-view-tracking-scope');
+    if (!scope) return null;
+    try {
+      const json = JSON.parse(scope);
+      const breadcrumb = json?.[0]?.breadcrumb;
+      if (!breadcrumb?.content?.data) return null;
+      const decoded = breadcrumb.content.data.map(b => String.fromCharCode(b)).join('');
+      const inner = JSON.parse(decoded);
+      if (inner.updateUrn) {
+        return { urn: inner.updateUrn, isSponsored: !!inner.isSponsored };
+      }
+    } catch (e) { /* invalid tracking data */ }
+    return null;
+  }
+
+  // Get URN from a post element (old data-urn or new tracking scope)
+  // Stamps element with data-td-urn for easy lookup later
+  function getPostUrn(element) {
+    const dataUrn = element.getAttribute('data-urn');
+    if (dataUrn?.startsWith('urn:li:activity:')) return dataUrn;
+
+    const stamped = element.getAttribute('data-td-urn');
+    if (stamped) return stamped;
+
+    const tracking = extractTrackingData(element);
+    if (tracking?.urn) {
+      element.setAttribute('data-td-urn', tracking.urn);
+      return tracking.urn;
+    }
+    return null;
+  }
+
+  // Check if element is a sponsored post via tracking data
+  function isTrackingSponsored(element) {
+    const tracking = extractTrackingData(element);
+    return tracking?.isSponsored || false;
+  }
+
+  // Find all feed post elements in the current DOM
+  function findFeedPosts() {
+    // Old LinkedIn: data-urn attribute
+    let posts = Array.from(document.querySelectorAll('[data-urn^="urn:li:activity"]'));
+    if (posts.length > 0) return posts;
+
+    // New LinkedIn: tracking scope with feed update data
+    const tracked = document.querySelectorAll('[data-view-tracking-scope]');
+    posts = Array.from(tracked).filter(el => {
+      const tracking = extractTrackingData(el);
+      if (tracking?.urn) {
+        el.setAttribute('data-td-urn', tracking.urn);
+        return true;
+      }
+      return false;
+    });
+
+    if (posts.length > 0) {
+      log(`Found ${posts.length} posts via tracking scope (new LinkedIn DOM)`);
+    }
+    return posts;
+  }
+
+  // Find post elements in DOM by URN (for removal)
+  function findPostElementsByUrn(urn) {
+    const oldMatches = document.querySelectorAll(`[data-urn="${urn}"]`);
+    if (oldMatches.length > 0) return Array.from(oldMatches);
+    return Array.from(document.querySelectorAll(`[data-td-urn="${urn}"]`));
   }
 
   // ============================================
@@ -539,12 +614,12 @@
           if (node.nodeType !== Node.ELEMENT_NODE) continue;
 
           // Check if the node itself is a post
-          if (node.getAttribute?.('data-urn')?.startsWith('urn:li:activity')) {
+          if (getPostUrn(node)) {
             if (addPostToQueue(node)) addedCount++;
           }
 
-          // Check for posts inside the node
-          const posts = node.querySelectorAll?.('[data-urn^="urn:li:activity"]') || [];
+          // Check for posts inside the node (old and new selectors)
+          const posts = node.querySelectorAll?.('[data-urn^="urn:li:activity"], [data-view-tracking-scope]') || [];
           posts.forEach(post => {
             if (addPostToQueue(post)) addedCount++;
           });
@@ -576,7 +651,7 @@
 
   function openTinderMode() {
     // Collect posts currently in DOM
-    const domPosts = Array.from(document.querySelectorAll('[data-urn^="urn:li:activity"]'));
+    const domPosts = findFeedPosts();
 
     if (domPosts.length === 0) {
       log('No posts found - scroll down a bit first');
@@ -605,7 +680,7 @@
   }
 
   function addPostToQueue(postElement) {
-    const urn = postElement.getAttribute('data-urn');
+    const urn = getPostUrn(postElement);
     if (!urn || feedState.seenUrns.has(urn)) return false;
 
     // Skip already hidden posts
@@ -614,12 +689,13 @@
       return false;
     }
 
-    // Auto-hide promoted posts (ads)
-    const promotedSpan = Array.from(postElement.querySelectorAll('span')).find(span => {
+    // Auto-hide promoted posts (ads) - check tracking data first, then DOM
+    const sponsoredByTracking = isTrackingSponsored(postElement);
+    const promotedSpan = !sponsoredByTracking && Array.from(postElement.querySelectorAll('span')).find(span => {
       const text = span.textContent?.trim().toLowerCase();
-      return text === 'promoted' || text === 'sponsoris\u00e9' || text === 'gesponsert' || text === 'patrocinado';
+      return text === 'promoted' || text === 'sponsorisé' || text === 'gesponsert' || text === 'patrocinado';
     });
-    const isPromoted = promotedSpan ||
+    const isPromoted = sponsoredByTracking || promotedSpan ||
                        postElement.querySelector('[data-ad-banner]') ||
                        postElement.querySelector('.ad-banner');
     if (isPromoted) {
@@ -691,7 +767,7 @@
     }
     await sleep(2000);
 
-    const domPosts = document.querySelectorAll('[data-urn^="urn:li:activity"]');
+    const domPosts = findFeedPosts();
 
     domPosts.forEach(post => {
       if (addPostToQueue(post)) addedCount++;
@@ -1061,18 +1137,18 @@
           if (node.closest?.('#tinkedin-tinder') || node.id === 'tinkedin-tinder') continue;
 
           // Check the node itself for swiped post (hidden or liked)
-          const urn = node.getAttribute?.('data-urn');
+          const urn = getPostUrn(node);
           if (urn && isSwipedPost(urn)) {
             node.remove();
             log(`Auto-removed swiped post: ${urn.slice(-12)}`);
             continue;
           }
 
-          // Check children for swiped posts
-          const posts = node.querySelectorAll?.('[data-urn]');
+          // Check children for swiped posts (old and new selectors)
+          const posts = node.querySelectorAll?.('[data-urn], [data-td-urn], [data-view-tracking-scope]');
           if (posts) {
             posts.forEach(post => {
-              const postUrn = post.getAttribute('data-urn');
+              const postUrn = getPostUrn(post);
               if (postUrn && isSwipedPost(postUrn)) {
                 post.remove();
                 log(`Auto-removed swiped post (child): ${postUrn.slice(-12)}`);
@@ -1099,7 +1175,7 @@
 
   function removePostFromDOM(urn) {
     // Remove all matching elements EXCEPT clones inside the tinder overlay
-    const elements = document.querySelectorAll(`[data-urn="${urn}"]`);
+    const elements = findPostElementsByUrn(urn);
     for (const el of elements) {
       if (!el.closest('#tinkedin-tinder')) {
         el.remove();
@@ -1112,7 +1188,7 @@
     let count = 0;
     const allSwiped = [...state.hiddenUrns, ...state.likedUrns];
     allSwiped.forEach(urn => {
-      const elements = document.querySelectorAll(`[data-urn="${urn}"]`);
+      const elements = findPostElementsByUrn(urn);
       for (const el of elements) {
         if (!el.closest('#tinkedin-tinder')) {
           el.remove();
@@ -1127,7 +1203,9 @@
 
   // Try to hide a post using LinkedIn's native hide button (for promoted posts)
   async function hidePostFromFeed(activityId) {
-    const postElement = document.querySelector(`[data-urn="urn:li:activity:${activityId}"]`);
+    const urn = `urn:li:activity:${activityId}`;
+    const matches = findPostElementsByUrn(urn);
+    const postElement = matches[0] || null;
     if (!postElement) return false;
 
     try {

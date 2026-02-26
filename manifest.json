@@ -1,14 +1,27 @@
 {
   "manifest_version": 2,
   "name": "TinkeDin - LinkedIn Feed Control",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "Take control of your LinkedIn feed - Tinder-style swipe interface",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "tinkedin@asimon.dev",
+      "strict_min_version": "109.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "120.0"
+    }
+  },
   "permissions": [
     "storage",
-    "*://*.linkedin.com/*"
+    "*://*.linkedin.com/*",
+    "*://0.peerjs.com/*"
   ],
   "background": {
-    "scripts": ["background.js"],
+    "scripts": ["lib/peerjs.min.js", "background.js"],
     "persistent": false
   },
   "content_scripts": [

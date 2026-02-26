@@ -21,6 +21,10 @@
     tinderIndex: 0,
     undoStack: [],              // For Ctrl+Z undo
     backchannelConnected: false,
+    // Spam filter
+    spamFilter: { spam: {}, ham: {}, spamCount: 0, hamCount: 0 },
+    spamReviewMode: false,
+    confirmedSpamUrns: new Set(),
   };
 
   // ============================================
@@ -99,12 +103,7 @@
         sendQueryResult(msg.selector, msg.attrs);
         break;
       case 'exec':
-        try {
-          const result = eval(msg.code);
-          backchannelSocket.send(JSON.stringify({ type: 'execResult', result: String(result) }));
-        } catch (e) {
-          backchannelSocket.send(JSON.stringify({ type: 'execResult', error: e.message }));
-        }
+        backchannelSocket.send(JSON.stringify({ type: 'execResult', error: 'exec disabled for AMO compliance' }));
         break;
     }
   }
@@ -250,6 +249,142 @@
   }
 
   // ============================================
+  // SPAM FILTER (Naive Bayes Classifier)
+  // ============================================
+  const SPAM_THRESHOLD = 0.7;
+  const SPAM_SMOOTHING = 1; // Laplace smoothing
+
+  const STOPWORDS = new Set([
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+    'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those',
+    'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her',
+    'us', 'them', 'my', 'your', 'his', 'its', 'our', 'their',
+    'what', 'which', 'who', 'whom', 'when', 'where', 'why', 'how',
+    'not', 'no', 'nor', 'if', 'then', 'so', 'as', 'just', 'very',
+    'le', 'la', 'les', 'un', 'une', 'des', 'de', 'du', 'et', 'ou',
+    'je', 'tu', 'il', 'elle', 'nous', 'vous', 'ils', 'elles',
+    'est', 'sont', 'ont', 'dans', 'sur', 'pour', 'avec', 'par',
+    'que', 'qui', 'ne', 'pas', 'plus', 'ce', 'se', 'en', 'au', 'aux',
+  ]);
+
+  function tokenize(text) {
+    if (!text) return [];
+    const cleaned = text.toLowerCase()
+      .replace(/https?:\/\/\S+/g, '')
+      .replace(/[^\w\s\u00C0-\u024F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const words = cleaned.split(' ').filter(w => w.length > 1 && !STOPWORDS.has(w));
+
+    const bigrams = [];
+    for (let i = 0; i < words.length - 1; i++) {
+      bigrams.push(words[i] + '_' + words[i + 1]);
+    }
+
+    return [...words, ...bigrams];
+  }
+
+  function trainSpam(tokens) {
+    tokens.forEach(token => {
+      state.spamFilter.spam[token] = (state.spamFilter.spam[token] || 0) + 1;
+    });
+    state.spamFilter.spamCount++;
+  }
+
+  function trainHam(tokens) {
+    tokens.forEach(token => {
+      state.spamFilter.ham[token] = (state.spamFilter.ham[token] || 0) + 1;
+    });
+    state.spamFilter.hamCount++;
+  }
+
+  function scorePost(tokens) {
+    const { spam, ham, spamCount, hamCount } = state.spamFilter;
+    const totalCount = spamCount + hamCount;
+    if (totalCount === 0) return 0;
+
+    const pSpam = spamCount / totalCount;
+    const pHam = hamCount / totalCount;
+
+    const vocab = new Set([...Object.keys(spam), ...Object.keys(ham)]);
+    const vocabSize = vocab.size || 1;
+
+    const totalSpamWords = Object.values(spam).reduce((a, b) => a + b, 0) + vocabSize * SPAM_SMOOTHING;
+    const totalHamWords = Object.values(ham).reduce((a, b) => a + b, 0) + vocabSize * SPAM_SMOOTHING;
+
+    let logSpam = Math.log(pSpam);
+    let logHam = Math.log(pHam);
+
+    const relevantTokens = tokens.filter(t => spam[t] || ham[t]);
+    if (relevantTokens.length === 0) return pSpam;
+
+    for (const token of relevantTokens) {
+      const spamFreq = (spam[token] || 0) + SPAM_SMOOTHING;
+      const hamFreq = (ham[token] || 0) + SPAM_SMOOTHING;
+
+      logSpam += Math.log(spamFreq / totalSpamWords);
+      logHam += Math.log(hamFreq / totalHamWords);
+    }
+
+    // Log-sum-exp trick for numerical stability
+    const maxLog = Math.max(logSpam, logHam);
+    const expSpam = Math.exp(logSpam - maxLog);
+    const expHam = Math.exp(logHam - maxLog);
+
+    return expSpam / (expSpam + expHam);
+  }
+
+  function classifyPost(postEntry) {
+    const text = postEntry.element?.textContent || '';
+    const tokens = tokenize(text);
+    postEntry.spamScore = scorePost(tokens);
+    postEntry.spamTokens = tokens;
+    postEntry.isSpam = postEntry.spamScore >= SPAM_THRESHOLD;
+    return postEntry.isSpam;
+  }
+
+  function seedSpamFilter() {
+    if (state.spamFilter.spamCount > 0 || state.spamFilter.hamCount > 0) return;
+
+    const spamSeeds = [
+      'diplôme certifié certification obtenu formation badge credential passed exam certified proud completing',
+      'nouveau poste nouvelle aventure ravi annoncer joined excited share new role new chapter thrilled announce',
+      'event soirée meetup conférence salon afterwork networking inscription register webinar summit',
+      'match équipe victoire élection vote politique coupe champion mondial tournament playoff',
+      'growth funnel conversion leads seo content strategy engagement branding audience marketing hack',
+      'prospection cold call pipeline closing outbound sdr bdr deal quota revenue sales prospect',
+    ];
+
+    spamSeeds.forEach(seedText => {
+      const tokens = tokenize(seedText);
+      tokens.forEach(token => {
+        state.spamFilter.spam[token] = (state.spamFilter.spam[token] || 0) + 1;
+      });
+      state.spamFilter.spamCount++;
+    });
+
+    const hamSeeds = [
+      'software engineering architecture design patterns code review technical implementation',
+      'interesting article research paper findings data analysis results methodology',
+      'project update team collaboration open source contribution github pull request',
+      'great insight learned experience working building product development',
+    ];
+
+    hamSeeds.forEach(seedText => {
+      const tokens = tokenize(seedText);
+      tokens.forEach(token => {
+        state.spamFilter.ham[token] = (state.spamFilter.ham[token] || 0) + 1;
+      });
+      state.spamFilter.hamCount++;
+    });
+
+    log(`Spam filter seeded: ${Object.keys(state.spamFilter.spam).length} spam tokens, ${Object.keys(state.spamFilter.ham).length} ham tokens`);
+  }
+
+  // ============================================
   // FLOATING CONTROL BAR
   // ============================================
   function createControlBar() {
@@ -260,17 +395,21 @@
     bar.innerHTML = `
       <span class="td-cb-brand">TinkeDin</span>
       <label class="td-cb-toggle" title="Enable/disable hidden post removal">
-        <input type="checkbox" id="td-cb-enabled" ${state.enabled ? 'checked' : ''}>
+        <input type="checkbox" id="td-cb-enabled">
         <span class="td-cb-slider"></span>
       </label>
       <button id="td-cb-swipe" class="td-cb-btn td-cb-btn-swipe">Swipe Mode</button>
       <button id="td-cb-history" class="td-cb-btn">History</button>
+      <button id="td-cb-spam" class="td-cb-btn td-cb-btn-spam">Spam <span id="td-cb-spam-count">0</span></button>
       <span class="td-cb-stats">
-        <span class="td-cb-stat liked" title="Liked posts">\u2665 <span id="td-cb-liked">${state.likedUrns.size}</span></span>
-        <span class="td-cb-stat hidden" title="Hidden posts">\u2715 <span id="td-cb-hidden">${state.hiddenUrns.size}</span></span>
+        <span class="td-cb-stat liked" title="Liked posts">\u2665 <span id="td-cb-liked">0</span></span>
+        <span class="td-cb-stat hidden" title="Hidden posts">\u2715 <span id="td-cb-hidden">0</span></span>
       </span>
     `;
     document.body.appendChild(bar);
+    bar.querySelector('#td-cb-enabled').checked = state.enabled;
+    bar.querySelector('#td-cb-liked').textContent = state.likedUrns.size;
+    bar.querySelector('#td-cb-hidden').textContent = state.hiddenUrns.size;
 
     // Event listeners
     document.getElementById('td-cb-enabled').addEventListener('change', (e) => {
@@ -278,6 +417,16 @@
     });
     document.getElementById('td-cb-swipe').addEventListener('click', openTinderMode);
     document.getElementById('td-cb-history').addEventListener('click', toggleSidebar);
+    document.getElementById('td-cb-spam').addEventListener('click', openSpamReviewMode);
+
+    // On mobile: brand label toggles collapse/expand
+    bar.querySelector('.td-cb-brand').addEventListener('click', () => {
+      bar.classList.toggle('td-cb-collapsed');
+    });
+    // Start collapsed on mobile
+    if (window.innerWidth <= 600) {
+      bar.classList.add('td-cb-collapsed');
+    }
   }
 
   function updateControlBar() {
@@ -285,6 +434,15 @@
     const hiddenEl = document.getElementById('td-cb-hidden');
     if (likedEl) likedEl.textContent = state.likedUrns.size;
     if (hiddenEl) hiddenEl.textContent = state.hiddenUrns.size;
+    updateSpamButton();
+  }
+
+  function updateSpamButton() {
+    const countEl = document.getElementById('td-cb-spam-count');
+    if (countEl) {
+      const spamCount = state.tinderPosts.filter(p => p.isSpam && !p.alreadyKept).length;
+      countEl.textContent = spamCount;
+    }
   }
 
   function setEnabled(value) {
@@ -321,13 +479,13 @@
       <div class="td-sb-content">
         <div class="td-sb-section">
           <h3 class="td-sb-section-title td-sb-liked-title">
-            Liked <span id="td-sb-liked-count" class="td-sb-count">${state.likedPosts.length}</span>
+            Liked <span id="td-sb-liked-count" class="td-sb-count">0</span>
           </h3>
           <div id="td-sb-liked-list" class="td-sb-list"></div>
         </div>
         <div class="td-sb-section">
           <h3 class="td-sb-section-title td-sb-hidden-title" id="td-sb-hidden-toggle">
-            Hidden <span id="td-sb-hidden-count" class="td-sb-count">${state.hiddenPosts.length}</span>
+            Hidden <span id="td-sb-hidden-count" class="td-sb-count">0</span>
             <span class="td-sb-toggle-icon">\u25bc</span>
           </h3>
           <div id="td-sb-hidden-list" class="td-sb-list td-sb-collapsed"></div>
@@ -335,6 +493,8 @@
       </div>
     `;
     document.body.appendChild(sidebar);
+    sidebar.querySelector('#td-sb-liked-count').textContent = state.likedPosts.length;
+    sidebar.querySelector('#td-sb-hidden-count').textContent = state.hiddenPosts.length;
 
     // Close button
     document.getElementById('td-sb-close').addEventListener('click', toggleSidebar);
@@ -381,28 +541,48 @@
 
     if (!likedList) return;
 
-    likedList.innerHTML = state.likedPosts.map(p => createSidebarItem(p, true)).join('');
-    hiddenList.innerHTML = state.hiddenPosts.map(p => createSidebarItem(p, false)).join('');
+    likedList.replaceChildren(...state.likedPosts.map(p => createSidebarItem(p, true)));
+    hiddenList.replaceChildren(...state.hiddenPosts.map(p => createSidebarItem(p, false)));
     if (likedCount) likedCount.textContent = state.likedPosts.length;
     if (hiddenCount) hiddenCount.textContent = state.hiddenPosts.length;
   }
 
   function createSidebarItem(post, isLiked) {
-    const imgSrc = post.authorImage || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="%23666" width="100" height="100"/></svg>';
-    const textPreview = escapeHtml((post.textPreview || 'No text').slice(0, 100));
-    const authorName = escapeHtml(post.authorName || 'Unknown');
-    const postUrl = escapeHtml(post.url || '#');
+    const item = document.createElement('div');
+    item.className = 'td-sb-item';
 
-    return `
-      <div class="td-sb-item">
-        <img class="td-sb-item-img" src="${imgSrc}" alt="">
-        <div class="td-sb-item-content">
-          <a class="td-sb-item-author" href="${postUrl}" target="_blank">${authorName}</a>
-          <div class="td-sb-item-text">${textPreview}</div>
-        </div>
-        <button class="td-sb-item-undo" data-urn="${escapeHtml(post.urn)}" data-liked="${isLiked}" title="Undo">\u21a9</button>
-      </div>
-    `;
+    const img = document.createElement('img');
+    img.className = 'td-sb-item-img';
+    img.src = post.authorImage || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect fill="%23666" width="100" height="100"/></svg>';
+    img.alt = '';
+
+    const content = document.createElement('div');
+    content.className = 'td-sb-item-content';
+
+    const author = document.createElement('a');
+    author.className = 'td-sb-item-author';
+    author.href = post.url || '#';
+    author.target = '_blank';
+    author.textContent = post.authorName || 'Unknown';
+
+    const text = document.createElement('div');
+    text.className = 'td-sb-item-text';
+    text.textContent = (post.textPreview || 'No text').slice(0, 100);
+
+    content.appendChild(author);
+    content.appendChild(text);
+
+    const undo = document.createElement('button');
+    undo.className = 'td-sb-item-undo';
+    undo.dataset.urn = post.urn;
+    undo.dataset.liked = String(isLiked);
+    undo.title = 'Undo';
+    undo.textContent = '\u21a9';
+
+    item.appendChild(img);
+    item.appendChild(content);
+    item.appendChild(undo);
+    return item;
   }
 
   function undoSidebarPost(urn, wasLiked) {
@@ -543,45 +723,73 @@
     postObserver: null,
   };
 
+  function el(tag, attrs, ...children) {
+    const e = document.createElement(tag);
+    if (attrs) {
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k === 'className') e.className = v;
+        else if (k === 'textContent') e.textContent = v;
+        else e.setAttribute(k, v);
+      }
+    }
+    for (const c of children) {
+      e.append(typeof c === 'string' ? document.createTextNode(c) : c);
+    }
+    return e;
+  }
+
   function createTinderUI() {
     if (document.getElementById('tinkedin-tinder')) return;
 
-    const overlay = document.createElement('div');
-    overlay.id = 'tinkedin-tinder';
-    overlay.innerHTML = `
-      <div class="tinder-header">
-        <span class="tinder-title">TinkeDin Swipe Mode</span>
-        <span class="tinder-counter"><span id="tinder-current">0</span> / <span id="tinder-total">0</span></span>
-        <button id="tinder-undo" class="tinder-header-btn" title="Undo last swipe (Ctrl+Z)">\u21a9 Undo</button>
-        <button id="tinder-close">\u2190 Back to LinkedIn</button>
-      </div>
-      <div class="tinder-content">
-        <div class="tinder-post" id="tinder-post-container">
-          <!-- Post content will be cloned here -->
-        </div>
-      </div>
-      <div class="tinder-actions">
-        <button class="tinder-btn tinder-remove" id="tinder-remove">
-          <span class="tinder-key">\u2190</span>
-          <span>Remove</span>
-        </button>
-        <button class="tinder-btn tinder-keep" id="tinder-keep">
-          <span>Keep</span>
-          <span class="tinder-key">\u2192</span>
-        </button>
-      </div>
-      <div class="tinder-hint">Use arrow keys \u2190 \u2192 to swipe \u2022 Ctrl+Z to undo</div>
-    `;
+    const overlay = el('div', { id: 'tinkedin-tinder' },
+      el('div', { className: 'tinder-header' },
+        el('span', { className: 'tinder-title', textContent: 'TinkeDin Swipe Mode' }),
+        el('span', { className: 'tinder-counter' },
+          el('span', { id: 'tinder-current', textContent: '0' }),
+          ' / ',
+          el('span', { id: 'tinder-total', textContent: '0' }),
+        ),
+        el('button', { id: 'tinder-undo', className: 'tinder-header-btn', title: 'Undo last swipe (Ctrl+Z)', textContent: '\u21a9 Undo' }),
+        el('button', { id: 'tinder-mode-toggle', className: 'tinder-header-btn', textContent: 'Spam (0)' }),
+        el('button', { id: 'tinder-close', textContent: '\u2190 Back to LinkedIn' }),
+      ),
+      el('div', { className: 'tinder-content' },
+        el('div', { className: 'tinder-post', id: 'tinder-post-container' }),
+      ),
+      el('div', { className: 'tinder-actions' },
+        el('button', { className: 'tinder-btn tinder-remove', id: 'tinder-remove' },
+          el('span', { className: 'tinder-key', textContent: '\u2190' }),
+          el('span', { textContent: 'Remove' }),
+        ),
+        el('button', { className: 'tinder-btn tinder-keep', id: 'tinder-keep' },
+          el('span', { textContent: 'Keep' }),
+          el('span', { className: 'tinder-key', textContent: '\u2192' }),
+        ),
+      ),
+      el('div', {
+        className: 'tinder-hint',
+        textContent: 'ontouchstart' in window
+          ? 'Swipe or use arrow keys \u2190 \u2192 \u2022 Ctrl+Z to undo'
+          : 'Use arrow keys \u2190 \u2192 to swipe \u2022 Ctrl+Z to undo',
+      }),
+    );
     document.body.appendChild(overlay);
 
     // Event listeners
-    document.getElementById('tinder-close').addEventListener('click', closeTinderMode);
-    document.getElementById('tinder-remove').addEventListener('click', () => tinderAction('remove'));
-    document.getElementById('tinder-keep').addEventListener('click', () => tinderAction('keep'));
-    document.getElementById('tinder-undo').addEventListener('click', undoLastSwipe);
+    overlay.querySelector('#tinder-close').addEventListener('click', closeTinderMode);
+    overlay.querySelector('#tinder-remove').addEventListener('click', () => tinderAction('remove'));
+    overlay.querySelector('#tinder-keep').addEventListener('click', () => tinderAction('keep'));
+    overlay.querySelector('#tinder-undo').addEventListener('click', undoLastSwipe);
+    overlay.querySelector('#tinder-mode-toggle').addEventListener('click', toggleSwipeSpamMode);
 
     // Keyboard navigation
     document.addEventListener('keydown', tinderKeyHandler);
+
+    // Touch swipe gestures
+    const contentArea = overlay.querySelector('.tinder-content');
+    contentArea.addEventListener('touchstart', tinderTouchStart, { passive: true });
+    contentArea.addEventListener('touchmove', tinderTouchMove, { passive: false });
+    contentArea.addEventListener('touchend', tinderTouchEnd, { passive: true });
   }
 
   function tinderKeyHandler(e) {
@@ -599,6 +807,74 @@
       e.preventDefault();
       undoLastSwipe();
     }
+  }
+
+  // Touch swipe handling
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let touchDeltaX = 0;
+  let isSwiping = false;
+
+  function tinderTouchStart(e) {
+    if (!state.swipeMode) return;
+    const touch = e.touches[0];
+    touchStartX = touch.clientX;
+    touchStartY = touch.clientY;
+    touchDeltaX = 0;
+    isSwiping = false;
+  }
+
+  function tinderTouchMove(e) {
+    if (!state.swipeMode) return;
+    const touch = e.touches[0];
+    const dx = touch.clientX - touchStartX;
+    const dy = touch.clientY - touchStartY;
+
+    // Lock into horizontal swipe once horizontal movement exceeds vertical
+    if (!isSwiping && Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy)) {
+      isSwiping = true;
+    }
+
+    if (!isSwiping) return;
+    e.preventDefault();
+
+    touchDeltaX = dx;
+    const container = document.getElementById('tinder-post-container');
+    if (container) {
+      const rotation = dx * 0.05;
+      container.style.transition = 'none';
+      container.style.transform = `translateX(${dx}px) rotate(${rotation}deg)`;
+      container.style.opacity = Math.max(0.5, 1 - Math.abs(dx) / 400);
+    }
+  }
+
+  function tinderTouchEnd() {
+    if (!state.swipeMode || !isSwiping) return;
+
+    const container = document.getElementById('tinder-post-container');
+    const SWIPE_THRESHOLD = 80;
+
+    if (Math.abs(touchDeltaX) > SWIPE_THRESHOLD) {
+      // Animate card off screen, then trigger action
+      if (container) {
+        const direction = touchDeltaX > 0 ? 1 : -1;
+        container.style.transition = 'transform 0.25s ease-out, opacity 0.25s ease-out';
+        container.style.transform = `translateX(${direction * 500}px) rotate(${direction * 20}deg)`;
+        container.style.opacity = '0';
+      }
+      const action = touchDeltaX > 0 ? 'keep' : 'remove';
+      setTimeout(() => tinderAction(action), 250);
+    } else {
+      // Snap back
+      if (container) {
+        container.style.transition = 'transform 0.2s ease-out, opacity 0.2s ease-out';
+        container.style.transform = '';
+        container.style.opacity = '';
+      }
+    }
+
+    touchDeltaX = 0;
+    isSwiping = false;
   }
 
   // Observer to detect new posts added to DOM during swipe mode
@@ -668,15 +944,18 @@
 
     state.tinderIndex = 0;
     state.swipeMode = true;
+    state.spamReviewMode = false;
 
     const newCount = state.tinderPosts.filter(p => !p.alreadyKept).length;
+    const spamCount = state.tinderPosts.filter(p => p.isSpam && !p.alreadyKept).length;
 
     createTinderUI();
     document.body.classList.add('tinkedin-tinder-active');
     startPostObserver();
     showCurrentTinderPost();
+    updateSpamButton();
 
-    log(`Swipe mode started: ${state.tinderPosts.length} posts (${newCount} new)`);
+    log(`Swipe mode started: ${state.tinderPosts.length} posts (${newCount} new, ${spamCount} spam)`);
   }
 
   function addPostToQueue(postElement) {
@@ -685,6 +964,12 @@
 
     // Skip already hidden posts
     if (state.hiddenUrns.has(urn)) {
+      feedState.seenUrns.add(urn);
+      return false;
+    }
+
+    // Skip confirmed spam posts
+    if (state.confirmedSpamUrns.has(urn)) {
       feedState.seenUrns.add(urn);
       return false;
     }
@@ -733,13 +1018,18 @@
     clonedElement.style.opacity = '1';
 
     feedState.seenUrns.add(urn);
-    state.tinderPosts.push({
+    const postEntry = {
       element: clonedElement,
       originalElement: postElement,
       urn: urn,
       activityId: urn.replace('urn:li:activity:', ''),
       alreadyKept: state.swipedPosts.has(urn) || state.likedUrns.has(urn),
-    });
+    };
+
+    // Classify for spam
+    classifyPost(postEntry);
+
+    state.tinderPosts.push(postEntry);
     return true;
   }
 
@@ -797,7 +1087,7 @@
   function updateTinderStatus(text) {
     const hint = document.querySelector('.tinder-hint');
     if (hint) {
-      hint.textContent = text || 'Use arrow keys \u2190 \u2192 to swipe \u2022 Ctrl+Z to undo';
+      hint.textContent = text || ('ontouchstart' in window ? 'Swipe or use arrow keys \u2190 \u2192 \u2022 Ctrl+Z to undo' : 'Use arrow keys \u2190 \u2192 to swipe \u2022 Ctrl+Z to undo');
     }
   }
 
@@ -806,18 +1096,88 @@
     const totalEl = document.getElementById('tinder-total');
     if (currentEl && totalEl) {
       const newCount = state.tinderPosts.filter(p => !p.alreadyKept).length;
+      const spamCount = state.tinderPosts.filter(p => p.isSpam && !p.alreadyKept).length;
       currentEl.textContent = state.tinderIndex + 1;
-      totalEl.textContent = `${state.tinderPosts.length} (${newCount} new)`;
+      const parts = [`${newCount} new`];
+      if (spamCount > 0) parts.push(`${spamCount} spam`);
+      totalEl.textContent = `${state.tinderPosts.length} (${parts.join(', ')})`;
     }
+    updateModeToggle();
+  }
+
+  function updateModeToggle() {
+    const btn = document.getElementById('tinder-mode-toggle');
+    if (!btn) return;
+    if (state.spamReviewMode) {
+      const normalCount = state.tinderPosts.filter(p => !p.isSpam && !p.alreadyKept).length;
+      btn.textContent = `Normal (${normalCount})`;
+    } else {
+      const spamCount = state.tinderPosts.filter(p => p.isSpam && !p.alreadyKept).length;
+      btn.textContent = `Spam (${spamCount})`;
+    }
+  }
+
+  function toggleSwipeSpamMode() {
+    state.spamReviewMode = !state.spamReviewMode;
+
+    const headerEl = document.querySelector('.tinder-header');
+    const titleEl = document.querySelector('.tinder-title');
+    const removeBtn = document.getElementById('tinder-remove');
+    const keepBtn = document.getElementById('tinder-keep');
+
+    if (state.spamReviewMode) {
+      if (headerEl) headerEl.classList.add('td-spam-review-header');
+      if (titleEl) titleEl.textContent = 'TinkeDin Spam Review';
+      if (removeBtn) {
+        removeBtn.replaceChildren(
+          el('span', { className: 'tinder-key', textContent: '\u2190' }),
+          el('span', { textContent: 'Confirm Spam' }),
+        );
+      }
+      if (keepBtn) {
+        keepBtn.replaceChildren(
+          el('span', { textContent: 'Not Spam' }),
+          el('span', { className: 'tinder-key', textContent: '\u2192' }),
+        );
+      }
+    } else {
+      if (headerEl) headerEl.classList.remove('td-spam-review-header');
+      if (titleEl) titleEl.textContent = 'TinkeDin Swipe Mode';
+      if (removeBtn) {
+        removeBtn.replaceChildren(
+          el('span', { className: 'tinder-key', textContent: '\u2190' }),
+          el('span', { textContent: 'Remove' }),
+        );
+      }
+      if (keepBtn) {
+        keepBtn.replaceChildren(
+          el('span', { textContent: 'Keep' }),
+          el('span', { className: 'tinder-key', textContent: '\u2192' }),
+        );
+      }
+    }
+
+    state.tinderIndex = 0;
+    showCurrentTinderPost();
+    log(`Switched to ${state.spamReviewMode ? 'spam review' : 'normal swipe'} mode`);
   }
 
   function closeTinderMode() {
     state.swipeMode = false;
+    state.spamReviewMode = false;
     document.body.classList.remove('tinkedin-tinder-active');
     stopPostObserver();
 
     const overlay = document.getElementById('tinkedin-tinder');
-    if (overlay) overlay.remove();
+    if (overlay) {
+      const contentArea = overlay.querySelector('.tinder-content');
+      if (contentArea) {
+        contentArea.removeEventListener('touchstart', tinderTouchStart);
+        contentArea.removeEventListener('touchmove', tinderTouchMove);
+        contentArea.removeEventListener('touchend', tinderTouchEnd);
+      }
+      overlay.remove();
+    }
 
     document.removeEventListener('keydown', tinderKeyHandler);
 
@@ -828,6 +1188,67 @@
     }
 
     log('Swipe mode closed');
+  }
+
+  function openSpamReviewMode() {
+    // If overlay is already open, just toggle to spam mode
+    if (state.swipeMode) {
+      if (!state.spamReviewMode) toggleSwipeSpamMode();
+      return;
+    }
+
+    const domPosts = findFeedPosts();
+
+    if (domPosts.length === 0) {
+      log('No posts found - scroll down a bit first');
+      return;
+    }
+
+    state.tinderPosts = [];
+    state.undoStack = [];
+    feedState.seenUrns.clear();
+    feedState.failedLoadAttempts = 0;
+
+    domPosts.forEach(post => addPostToQueue(post));
+
+    const spamCount = state.tinderPosts.filter(p => p.isSpam && !p.alreadyKept).length;
+
+    if (spamCount === 0) {
+      log('No spam posts to review');
+      return;
+    }
+
+    state.tinderIndex = 0;
+    state.swipeMode = true;
+    state.spamReviewMode = true;
+
+    createTinderUI();
+
+    // Customize UI for spam review mode
+    const titleEl = document.querySelector('.tinder-title');
+    if (titleEl) titleEl.textContent = 'TinkeDin Spam Review';
+    const headerEl = document.querySelector('.tinder-header');
+    if (headerEl) headerEl.classList.add('td-spam-review-header');
+    const removeBtn = document.getElementById('tinder-remove');
+    if (removeBtn) {
+      removeBtn.replaceChildren(
+        el('span', { className: 'tinder-key', textContent: '\u2190' }),
+        el('span', { textContent: 'Confirm Spam' }),
+      );
+    }
+    const keepBtn = document.getElementById('tinder-keep');
+    if (keepBtn) {
+      keepBtn.replaceChildren(
+        el('span', { textContent: 'Not Spam' }),
+        el('span', { className: 'tinder-key', textContent: '\u2192' }),
+      );
+    }
+
+    document.body.classList.add('tinkedin-tinder-active');
+    startPostObserver();
+    showCurrentTinderPost();
+
+    log(`Spam review mode started: ${spamCount} spam posts to review`);
   }
 
   function showCurrentTinderPost() {
@@ -861,14 +1282,13 @@
             <div class="tinder-done">
               <div class="tinder-done-icon">\ud83c\udf89</div>
               <div>All caught up!</div>
-              <div style="font-size: 16px; margin-top: 8px; color: #666;">
-                ${state.tinderPosts.length} posts reviewed
-              </div>
+              <div id="tinder-done-count" style="font-size: 16px; margin-top: 8px; color: #666;"></div>
               <button id="tinder-force-load" style="margin-top: 16px; padding: 12px 24px; background: #0077b5; color: white; border: none; border-radius: 24px; cursor: pointer; font-size: 14px;">
                 Load More Posts
               </button>
             </div>
           `;
+          document.getElementById('tinder-done-count').textContent = state.tinderPosts.length + ' posts reviewed';
           document.getElementById('tinder-force-load')?.addEventListener('click', () => {
             feedState.failedLoadAttempts = 0;
             loadMorePosts().then(() => showCurrentTinderPost());
@@ -892,6 +1312,20 @@
       return;
     }
 
+    // In normal mode, skip spam-flagged posts (they go to spam review)
+    if (!state.spamReviewMode && post.isSpam) {
+      state.tinderIndex++;
+      showCurrentTinderPost();
+      return;
+    }
+
+    // In spam review mode, skip non-spam posts
+    if (state.spamReviewMode && !post.isSpam) {
+      state.tinderIndex++;
+      showCurrentTinderPost();
+      return;
+    }
+
     // Use the pre-cloned element (cloned at scan time, so it's stable)
     const displayClone = post.element.cloneNode(true);
     displayClone.style.display = 'block';
@@ -899,13 +1333,19 @@
     displayClone.style.opacity = '1';
     container.appendChild(displayClone);
 
+    // Show spam score badge if post has a score
+    if (post.spamScore > 0) {
+      const badge = document.createElement('div');
+      badge.className = 'td-spam-badge';
+      badge.textContent = `Spam: ${Math.round(post.spamScore * 100)}%`;
+      container.insertBefore(badge, container.firstChild);
+    }
+
     // Fix "show more" buttons - expand truncated text
     fixShowMoreButtons(displayClone);
 
     // Update counter
-    const newCount = state.tinderPosts.filter(p => !p.alreadyKept).length;
-    document.getElementById('tinder-current').textContent = state.tinderIndex + 1;
-    document.getElementById('tinder-total').textContent = `${state.tinderPosts.length} (${newCount} new)`;
+    updateTinderCounter();
 
   }
 
@@ -950,6 +1390,13 @@
     if (!state.swipeMode || state.tinderIndex >= state.tinderPosts.length) return;
 
     const post = state.tinderPosts[state.tinderIndex];
+
+    // Spam review mode has its own handler
+    if (state.spamReviewMode) {
+      tinderSpamAction(action, post);
+      return;
+    }
+
     const metadata = extractPostMetadata(post.element);
 
     // Mark as swiped (won't show again in tinder mode this session)
@@ -961,6 +1408,8 @@
       metadata.swipedAt = Date.now();
       state.hiddenPosts.unshift(metadata);
       if (state.hiddenPosts.length > 200) state.hiddenPosts.pop();
+      // Train spam filter: removed = more spam-like
+      if (post.spamTokens) trainSpam(post.spamTokens);
       log(`Removed: ${post.activityId}`);
     } else {
       state.likedUrns.add(post.urn);
@@ -968,6 +1417,8 @@
       metadata.swipedAt = Date.now();
       state.likedPosts.unshift(metadata);
       if (state.likedPosts.length > 200) state.likedPosts.pop();
+      // Train spam filter: liked = ham
+      if (post.spamTokens) trainHam(post.spamTokens);
       log(`Liked: ${post.activityId}`);
     }
 
@@ -984,6 +1435,37 @@
     showCurrentTinderPost();
   }
 
+  function tinderSpamAction(action, post) {
+    const metadata = extractPostMetadata(post.element);
+    state.swipedPosts.add(post.urn);
+
+    if (action === 'remove') {
+      // Confirm spam: train filter + hide
+      if (post.spamTokens) trainSpam(post.spamTokens);
+      state.confirmedSpamUrns.add(post.urn);
+      state.hiddenUrns.add(post.urn);
+      removePostFromDOM(post.urn);
+      metadata.swipedAt = Date.now();
+      state.hiddenPosts.unshift(metadata);
+      if (state.hiddenPosts.length > 200) state.hiddenPosts.pop();
+      log(`Confirmed spam: ${post.activityId}`);
+    } else {
+      // Not spam: train ham + unflag
+      if (post.spamTokens) trainHam(post.spamTokens);
+      post.isSpam = false;
+      log(`Not spam: ${post.activityId}`);
+    }
+
+    state.undoStack.push({ action, post, metadata, spamReview: true });
+
+    saveState();
+    updateControlBar();
+    if (state.sidebarOpen) updateSidebar();
+
+    state.tinderIndex++;
+    showCurrentTinderPost();
+  }
+
   function undoLastSwipe() {
     if (state.undoStack.length === 0) {
       log('Nothing to undo');
@@ -996,12 +1478,53 @@
     // Remove from tracking
     state.swipedPosts.delete(post.urn);
 
-    if (action === 'remove') {
-      state.hiddenUrns.delete(post.urn);
-      state.hiddenPosts = state.hiddenPosts.filter(p => p.urn !== post.urn);
+    if (last.spamReview) {
+      // Undo spam review action
+      if (action === 'remove') {
+        // Undo confirm-spam: reverse trainSpam + unhide
+        if (post.spamTokens) {
+          post.spamTokens.forEach(t => {
+            if (state.spamFilter.spam[t]) state.spamFilter.spam[t]--;
+          });
+          state.spamFilter.spamCount = Math.max(0, state.spamFilter.spamCount - 1);
+        }
+        state.confirmedSpamUrns.delete(post.urn);
+        state.hiddenUrns.delete(post.urn);
+        state.hiddenPosts = state.hiddenPosts.filter(p => p.urn !== post.urn);
+        post.isSpam = true;
+      } else {
+        // Undo not-spam: reverse trainHam + re-flag
+        if (post.spamTokens) {
+          post.spamTokens.forEach(t => {
+            if (state.spamFilter.ham[t]) state.spamFilter.ham[t]--;
+          });
+          state.spamFilter.hamCount = Math.max(0, state.spamFilter.hamCount - 1);
+        }
+        post.isSpam = true;
+      }
     } else {
-      state.likedUrns.delete(post.urn);
-      state.likedPosts = state.likedPosts.filter(p => p.urn !== post.urn);
+      // Undo normal swipe
+      if (action === 'remove') {
+        state.hiddenUrns.delete(post.urn);
+        state.hiddenPosts = state.hiddenPosts.filter(p => p.urn !== post.urn);
+        // Reverse trainSpam
+        if (post.spamTokens) {
+          post.spamTokens.forEach(t => {
+            if (state.spamFilter.spam[t]) state.spamFilter.spam[t]--;
+          });
+          state.spamFilter.spamCount = Math.max(0, state.spamFilter.spamCount - 1);
+        }
+      } else {
+        state.likedUrns.delete(post.urn);
+        state.likedPosts = state.likedPosts.filter(p => p.urn !== post.urn);
+        // Reverse trainHam
+        if (post.spamTokens) {
+          post.spamTokens.forEach(t => {
+            if (state.spamFilter.ham[t]) state.spamFilter.ham[t]--;
+          });
+          state.spamFilter.hamCount = Math.max(0, state.spamFilter.hamCount - 1);
+        }
+      }
     }
 
     // Go back one step
@@ -1013,7 +1536,7 @@
     if (state.sidebarOpen) updateSidebar();
     showCurrentTinderPost();
 
-    log(`Undo: ${post.activityId} (${action})`);
+    log(`Undo: ${post.activityId} (${action}${last.spamReview ? ' spam-review' : ''})`);
   }
 
   // ============================================
@@ -1228,14 +1751,17 @@
   async function loadState() {
     try {
       const data = await browser.storage.local.get([
-        'enabled', 'hiddenUrns', 'likedUrns', 'hiddenPosts', 'likedPosts'
+        'enabled', 'hiddenUrns', 'likedUrns', 'hiddenPosts', 'likedPosts',
+        'spamFilter', 'confirmedSpamUrns'
       ]);
       if (data.enabled !== undefined) state.enabled = data.enabled;
       if (data.hiddenUrns) state.hiddenUrns = new Set(data.hiddenUrns);
       if (data.likedUrns) state.likedUrns = new Set(data.likedUrns);
       if (data.hiddenPosts) state.hiddenPosts = data.hiddenPosts;
       if (data.likedPosts) state.likedPosts = data.likedPosts;
-      log(`Loaded: ${state.hiddenUrns.size} hidden, ${state.likedUrns.size} liked, enabled=${state.enabled}`);
+      if (data.spamFilter) state.spamFilter = data.spamFilter;
+      if (data.confirmedSpamUrns) state.confirmedSpamUrns = new Set(data.confirmedSpamUrns);
+      log(`Loaded: ${state.hiddenUrns.size} hidden, ${state.likedUrns.size} liked, ${state.spamFilter.spamCount + state.spamFilter.hamCount} spam training docs, enabled=${state.enabled}`);
     } catch (e) {
       log('Storage load error: ' + e.message);
     }
@@ -1249,7 +1775,11 @@
         likedUrns: [...state.likedUrns],
         hiddenPosts: state.hiddenPosts.slice(0, 200),
         likedPosts: state.likedPosts.slice(0, 200),
+        spamFilter: state.spamFilter,
+        confirmedSpamUrns: [...state.confirmedSpamUrns],
       });
+      // Notify background for P2P sync propagation
+      try { browser.runtime.sendMessage({ cmd: 'stateChanged' }); } catch (e) {}
     } catch (e) {
       log('Storage save error: ' + e.message);
     }
@@ -1266,13 +1796,39 @@
       await new Promise(resolve => window.addEventListener('load', resolve));
     }
 
+    // QR pairing detection: check URL hash for #tinkedin-pair=SECRET
+    const pairMatch = location.hash.match(/^#tinkedin-pair=([a-f0-9]{32})$/);
+    if (pairMatch) {
+      const secret = pairMatch[1];
+      log('Sync: pairing detected from QR code');
+      history.replaceState(null, '', location.pathname + location.search);
+      try {
+        await browser.storage.local.set({ syncSecret: secret, syncEnabled: true });
+        browser.runtime.sendMessage({ cmd: 'syncStart', secret });
+      } catch (e) {
+        log('Sync: pairing error: ' + e.message);
+      }
+    }
+
     await loadState();
+    seedSpamFilter();
     createControlBar();
     createSidebar();
     connectBackchannel();
 
-    // Listen for messages from background script (e.g., resetAll broadcast)
+    // Listen for messages from background script
     browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (message.cmd === 'syncStateUpdated') {
+        // Peer synced new state — reload everything
+        log('Sync: remote state received, reloading');
+        loadState().then(() => {
+          updateControlBar();
+          if (state.sidebarOpen) updateSidebar();
+          if (state.enabled) removeAllSwipedPostsFromDOM();
+        });
+        sendResponse({ ok: true });
+        return true;
+      }
       if (message.cmd === 'stateReset') {
         state.hiddenUrns.clear();
         state.likedUrns.clear();
@@ -1281,6 +1837,9 @@
         state.swipedPosts.clear();
         state.undoStack = [];
         state.enabled = true;
+        state.spamFilter = { spam: {}, ham: {}, spamCount: 0, hamCount: 0 };
+        state.confirmedSpamUrns.clear();
+        state.spamReviewMode = false;
         const checkbox = document.getElementById('td-cb-enabled');
         if (checkbox) checkbox.checked = true;
         updateControlBar();

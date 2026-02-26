@@ -78,6 +78,101 @@
     .btn-reset:hover {
       background: rgba(231, 76, 60, 0.3);
     }
+
+    /* Sync section */
+    .sync-section {
+      margin-top: 16px;
+      padding-top: 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .sync-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .sync-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #aaa;
+    }
+    .sync-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #555;
+      flex-shrink: 0;
+    }
+    .sync-dot.disconnected { background: #555; }
+    .sync-dot.connecting { background: #e0a030; animation: pulse 1.5s infinite; }
+    .sync-dot.waiting { background: #e0a030; animation: pulse 1.5s infinite; }
+    .sync-dot.connected { background: #00d4aa; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .sync-status-text {
+      font-size: 11px;
+      color: #888;
+      margin-left: auto;
+    }
+    .sync-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .btn-sync {
+      padding: 8px 12px;
+      background: rgba(0, 119, 181, 0.2);
+      color: #0077b5;
+      border: 1px solid rgba(0, 119, 181, 0.3);
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      text-align: center;
+    }
+    .btn-sync:hover {
+      background: rgba(0, 119, 181, 0.3);
+    }
+    .btn-sync-now {
+      background: rgba(0, 212, 170, 0.2);
+      color: #00d4aa;
+      border-color: rgba(0, 212, 170, 0.3);
+    }
+    .btn-sync-now:hover {
+      background: rgba(0, 212, 170, 0.3);
+    }
+    .btn-unpair {
+      background: rgba(231, 76, 60, 0.15);
+      color: #e74c3c;
+      border-color: rgba(231, 76, 60, 0.3);
+    }
+    .btn-unpair:hover {
+      background: rgba(231, 76, 60, 0.25);
+    }
+    .sync-qr-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .sync-qr-container canvas {
+      border-radius: 8px;
+    }
+    .sync-qr-hint {
+      font-size: 10px;
+      color: #666;
+      text-align: center;
+      line-height: 1.4;
+    }
+    .sync-last {
+      font-size: 10px;
+      color: #555;
+      text-align: center;
+      margin-top: 8px;
+    }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
@@ -101,6 +196,29 @@
     <button id="reset-btn" class="btn-reset">Reset</button>
   </div>
 
+  <!-- Sync Section -->
+  <div class="sync-section">
+    <div class="sync-header">
+      <div class="sync-dot" id="sync-dot"></div>
+      <span class="sync-title">Device Sync</span>
+      <span class="sync-status-text" id="sync-status-text">Disconnected</span>
+    </div>
+
+    <div class="sync-actions">
+      <button id="sync-pair-btn" class="btn-sync">Pair Device</button>
+      <button id="sync-now-btn" class="btn-sync btn-sync-now hidden">Sync Now</button>
+      <button id="sync-unpair-btn" class="btn-sync btn-unpair hidden">Unpair</button>
+    </div>
+
+    <div id="sync-qr-container" class="sync-qr-container hidden">
+      <div id="sync-qr-canvas"></div>
+      <div class="sync-qr-hint">Scan with your phone camera.<br>Opens LinkedIn and pairs automatically.</div>
+    </div>
+
+    <div id="sync-last" class="sync-last hidden"></div>
+  </div>
+
+  <script src="lib/qr.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

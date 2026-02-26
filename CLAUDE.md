@@ -128,6 +128,16 @@ WebSocket server on port 9777 for real-time debugging. Both content.js and backg
 11. Reload page: state persists, previously hidden posts still hidden
 12. Run backchannel server (`node backchannel-server.js`), verify logs flow
 
+## Deployment
+
+### AMO (addons.mozilla.org)
+Credentials are stored in `.amo-credentials` (gitignored). To deploy a new version:
+```bash
+source .amo-credentials
+npx web-ext sign --api-key="$AMO_API_KEY" --api-secret="$AMO_API_SECRET" --channel=unlisted
+```
+The signed .xpi will be placed in `web-ext-artifacts/`.
+
 ## Future Improvements
 
 - Extract images from posts for richer sidebar display
